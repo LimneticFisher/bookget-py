@@ -51,6 +51,8 @@ export interface ManifestData {
   progress: ManifestProgress;
   created_at: string;
   updated_at: string;
+  /** Folder the server resolved for this book (discover with outputRoot). */
+  output_dir?: string;
 }
 
 /** Site information */

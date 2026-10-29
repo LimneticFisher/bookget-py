@@ -4,6 +4,8 @@ import type { ManifestData, SiteInfo, DownloadEvent } from '../types';
 export interface DiscoverRequest {
   url: string;
   outputDir?: string;
+  /** Parent folder; the server puts the book in `<outputRoot>/<book_id>`. */
+  outputRoot?: string;
   depth?: number;
 }
 
@@ -14,6 +16,8 @@ export interface DownloadRequest {
   outputDir: string;
   nodeIds?: string[];
   concurrency?: number;
+  /** Build the archival PDF once the download finishes. */
+  pdf?: boolean;
 }
 
 /** Request to expand a manifest node */
