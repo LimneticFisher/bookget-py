@@ -392,7 +392,7 @@ class TaskManager:
                 )
             else:
                 manifest = await self._download_whole_book(
-                    manager, url, output_dir, index_id, progress_cb)
+                    manager, url, output_dir, index_id, progress_cb, task_id)
             info.manifest = manifest
             pdf_path = None
             if make_pdf:
@@ -427,7 +427,7 @@ class TaskManager:
 
     async def _download_whole_book(
         self, manager: ResourceManager, url: str, output_dir: str,
-        index_id: str, progress_cb,
+        index_id: str, progress_cb, task_id: str = "",
     ) -> DownloadManifest | None:
         """Download with the CLI's whole-book path, then mark the manifest done.
 
@@ -437,8 +437,15 @@ class TaskManager:
         selection does not apply here: the whole book is fetched.
         """
         dest = Path(output_dir)
+        def listing_cb(found: int, total: int):
+            self.bus.publish("progress", {
+                "taskId": task_id, "phase": "listing", "completed": found, "total": total,
+                "percent": round(found * 100 / total) if total else 0,
+            })
+
         task = await manager.download(
-            url, output_dir=dest, index_id=index_id, progress_callback=progress_cb)
+            url, output_dir=dest, index_id=index_id, progress_callback=progress_cb,
+            listing_callback=listing_cb)
         if task.failed_count:
             raise RuntimeError(
                 f"{task.failed_count}/{task.total_resources} 个文件下载失败，可重新下载以补全")

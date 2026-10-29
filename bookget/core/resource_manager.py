@@ -45,6 +45,7 @@ class ResourceManager:
         index_id: str = "",
         progress_callback: Callable[[int, int], None] = None,
         adapter_options: dict = None,
+        listing_callback: Callable[[int, int], None] = None,
     ) -> DownloadTask:
         """
         Download all resources from a URL.
@@ -112,7 +113,15 @@ class ResourceManager:
 
             # Get and download images
             if include_images:
-                task.resources = await adapter.get_image_list(book_id)
+                import inspect
+                if listing_callback and "progress_callback" in inspect.signature(
+                        adapter.get_image_list).parameters:
+                    # Sites that page through a reader to list images (识典古籍)
+                    # report pages found so far.
+                    task.resources = await adapter.get_image_list(
+                        book_id, progress_callback=listing_callback)
+                else:
+                    task.resources = await adapter.get_image_list(book_id)
                 task.total_resources = len(task.resources)
                 logger.info(f"Found {task.total_resources} images")
 

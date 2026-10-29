@@ -4,6 +4,7 @@
 # Uses Playwright browser automation to bypass ByteDance SecSDK anti-bot protection.
 # SecSDK generates device fingerprints (verifyFp / a_bogus) required for all API calls.
 
+import os
 import re
 import sys
 import asyncio
@@ -62,18 +63,6 @@ class ShidianGujiAdapter(BaseSiteAdapter):
     # downloads collected 0 paragraphs while still reporting success (issue #1).
     # Staying version-agnostic means the next bump doesn't break us the same way.
     _PARAGRAPHS_API_RE = re.compile(r"/api/ancientlib/read/book/paragraphs/v\d+")
-
-    # Scroll the tallest scrollable container (the reader pane) down one
-    # screenful. The reader lazy-loads page images as they approach the
-    # viewport, so this is what makes signed CDN URLs appear.
-    _SCROLL_READER_JS = """() => {
-        const els = Array.from(document.querySelectorAll('*'))
-            .filter(e => e.scrollHeight > e.clientHeight + 200 && e.clientHeight > 200);
-        if (!els.length) return false;
-        const e = els.sort((a, b) => b.scrollHeight - a.scrollHeight)[0];
-        e.scrollTop = e.scrollTop + e.clientHeight * 0.85;
-        return true;
-    }"""
 
     _USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -158,6 +147,16 @@ class ShidianGujiAdapter(BaseSiteAdapter):
                 pass
             self._pw = None
 
+    @staticmethod
+    def _proxy_args() -> list:
+        """Connect directly unless BOOKGET_SHIDIAN_PROXY=1.
+
+        Chromium follows the Windows system proxy by default. Through a local
+        rule-based proxy (seen with Clash on port 7897) the reader's page
+        images never loaded, while a direct connection loaded them.
+        """
+        return [] if os.environ.get("BOOKGET_SHIDIAN_PROXY") == "1" else ["--no-proxy-server"]
+
     async def _launch_browser(self):
         """Start Playwright, launch Chromium, return (pw, browser, context).
 
@@ -170,7 +169,7 @@ class ShidianGujiAdapter(BaseSiteAdapter):
         self._check_playwright()
         pw = await async_playwright().start()
         try:
-            browser = await pw.chromium.launch(headless=True)
+            browser = await pw.chromium.launch(headless=True, args=self._proxy_args())
         except Exception as e:
             await pw.stop()
             raise DownloadError(
@@ -369,19 +368,49 @@ class ShidianGujiAdapter(BaseSiteAdapter):
     # Image list
     # ------------------------------------------------------------------
 
-    async def get_image_list(self, book_id: str) -> List[Resource]:
-        """
-        Collect signed CDN image URLs for all pages.
+    # Pacing for walking the reader through a whole book. The reader only
+    # loads pages near where it is showing, so we move through it the way a
+    # person reading would: one volume at a time from the table of contents,
+    # scrolling the text a little and pausing. Slow on purpose — reading a
+    # whole book this way takes about 3 s a page.
+    _SCROLL_STEP = 0.25         # fraction of the text pane per scroll (0.4 skipped ~1 page in 5)
+    _SCROLL_PAUSE = 3.0         # seconds between scrolls
+    _CHAPTER_PAUSE = 6.0        # seconds after opening a volume
+    _TEXT_PANE = ".chapter-reader-container"
+    _TOC_ITEM = ".semi-tree-option"
+    _TOC_LIST = ".semi-tree-option-list"
 
-        Strategy: open book reader in Playwright, intercept byteimg.com requests
-        while scrolling the reader pane to lazy-load every page. Each scroll
-        advances the reader; the browser fetches the visible page's image from CDN.
+    _SCROLL_TEXT_JS = """([sel, step]) => {
+        const e = document.querySelector(sel);
+        if (!e) return null;
+        const before = e.scrollTop;
+        e.scrollTop = before + e.clientHeight * step;
+        return e.scrollTop > before;
+    }"""
+
+    async def get_image_list(self, book_id: str,
+                             progress_callback: Callable[[int, int], None] = None) -> List[Resource]:
+        """
+        Collect signed CDN image URLs for every page of the book.
+
+        The reader requests a page list and page images only for the volume
+        and position it is showing, so a single load yields the first ~10
+        pages. This opens each volume from the table of contents in turn and
+        scrolls its text slowly, recording the page lists, signed image URLs
+        and character boxes the reader loads by itself. Stops at once if the
+        site starts refusing requests (errorCode 31000).
         """
         self._check_playwright()
 
-        pages_data: list[dict] = []     # [{pageNum, uri, ...}] from pages/v3 API
-        image_map: dict[str, str] = {}  # uri -> full signed CDN URL
+        try:
+            expected = int((await self.get_metadata(book_id)).pages or 0)
+        except Exception:
+            expected = 0
+
+        pages_by_num: dict[int, dict] = {}   # pageNum -> page entry from pages/v3
+        image_map: dict[str, str] = {}       # uri -> full signed CDN URL
         pages_event = asyncio.Event()
+        refused = asyncio.Event()
 
         pw, browser, context = await self._launch_browser()
         try:
@@ -394,6 +423,8 @@ class ShidianGujiAdapter(BaseSiteAdapter):
 
             async def on_request(request):
                 url = request.url
+                if self._CDN_HOST in url:
+                    logger.debug(f"[识典古籍] image request: {url[:160]}")
                 if self._CDN_HOST in url and "ancientlib" in url and ".webp" in url:
                     uri = _extract_uri_from_cdn_url(url)
                     if uri and uri not in image_map:
@@ -401,14 +432,21 @@ class ShidianGujiAdapter(BaseSiteAdapter):
 
             async def on_response(response):
                 await self._record_layout(response)
-                if "/api/ancientlib/read/book/pages/v3/" in response.url:
-                    try:
-                        data = await response.json()
-                        if data.get("errorCode") == 0:
-                            pages_data.extend(data["data"]["pages"])
-                            pages_event.set()
-                    except Exception:
-                        pass
+                if "/api/ancientlib/" not in response.url:
+                    return
+                try:
+                    data = await response.json()
+                except Exception:
+                    return
+                if data.get("errorCode") == 31000:
+                    refused.set()
+                if "/api/ancientlib/read/book/pages/v3/" in response.url and data.get("errorCode") == 0:
+                    for pg in data["data"]["pages"]:
+                        try:
+                            pages_by_num[int(pg["pageNum"])] = pg
+                        except (KeyError, TypeError, ValueError):
+                            pass
+                    pages_event.set()
 
             page.on("request", on_request)
             page.on("response", on_response)
@@ -416,66 +454,86 @@ class ShidianGujiAdapter(BaseSiteAdapter):
             book_url = f"{self.BASE_URL}/zh/book/{book_id}"
             logger.info(f"[识典古籍] Loading book reader: {book_url}")
             try:
-                await page.goto(book_url, wait_until="domcontentloaded", timeout=60000)
+                await page.goto(book_url, wait_until="domcontentloaded", timeout=90000)
             except Exception as e:
                 logger.warning(f"Page.goto: {e}")
 
-            # Wait for pages list API
             try:
                 await asyncio.wait_for(pages_event.wait(), timeout=self._API_WAIT)
             except asyncio.TimeoutError:
                 logger.warning(f"Timeout waiting for pages API for {book_id}")
-
-            total_pages = len(pages_data)
-            if total_pages == 0:
+            if refused.is_set():
+                raise DownloadError("[识典古籍] 站点拒绝了请求（31000，访问过于频繁），请过一段时间再试。")
+            if not pages_by_num:
                 logger.warning("No page data found; returning empty image list")
                 return []
 
-            logger.info(f"[识典古籍] Book has {total_pages} pages, navigating to capture image URLs...")
+            def captured() -> int:
+                return sum(1 for pg in pages_by_num.values() if pg.get("uri") in image_map)
 
-            # Give the first page time to load its image
-            await asyncio.sleep(3)
+            def report() -> None:
+                if progress_callback:
+                    try:
+                        progress_callback(captured(), expected or len(pages_by_num))
+                    except Exception:
+                        pass
 
-            # Scroll the reader pane to force lazy-loading of page images.
-            #
-            # This used to press ArrowRight, but in the current reader that
-            # pages the TEXT column and never makes the image pane load more,
-            # so only the 2 initially-visible images were ever signed (34/36
-            # pages came back "No signed URL found"). Scrolling the tallest
-            # scrollable container is what actually advances the images.
-            stall_count = 0
-            prev_len = len(image_map)
-            max_stall = 25      # stop after this many scrolls yield no new images
+            async def read_through_current_volume() -> None:
+                """Scroll the text pane to the end, slowly."""
+                stuck = 0
+                while stuck < 2 and not refused.is_set():
+                    moved = await page.evaluate(self._SCROLL_TEXT_JS,
+                                                [self._TEXT_PANE, self._SCROLL_STEP])
+                    await asyncio.sleep(self._SCROLL_PAUSE)
+                    stuck = 0 if moved else stuck + 1
+                    report()
+                    if expected and captured() >= expected:
+                        return
 
-            for nav in range(total_pages * 4 + 40):
-                if len(image_map) >= total_pages:
-                    break
-                await page.evaluate(self._SCROLL_READER_JS)
-                await asyncio.sleep(0.8)
+            await asyncio.sleep(self._CHAPTER_PAUSE)
+            await read_through_current_volume()
 
-                if len(image_map) == prev_len:
-                    stall_count += 1
-                    if stall_count >= max_stall:
-                        logger.warning(
-                            f"[识典古籍] No new images after {max_stall} scrolls; stopping early "
-                            f"({len(image_map)}/{total_pages} captured)"
-                        )
-                        break
-                else:
-                    stall_count = 0
-                    prev_len = len(image_map)
+            # The table of contents is a virtualised list: only the items in
+            # view exist in the DOM, so scroll it to reveal the rest.
+            toc = page.locator(self._TOC_ITEM)
+            texts = await toc.all_inner_texts()
+            visited = {texts[0]} if texts else set()
+            logger.info("[识典古籍] reading the book volume by volume, slowly")
+            while not refused.is_set() and not (expected and captured() >= expected):
+                texts = await toc.all_inner_texts()
+                todo = next((i for i, t in enumerate(texts) if t not in visited), None)
+                if todo is None:
+                    before = texts
+                    await page.evaluate(self._SCROLL_TEXT_JS, [self._TOC_LIST, 0.8])
+                    await asyncio.sleep(1.5)
+                    if await toc.all_inner_texts() == before:
+                        break                       # end of the table of contents
+                    continue
+                visited.add(texts[todo])
+                try:
+                    await toc.nth(todo).click(timeout=15000)
+                except Exception as e:
+                    logger.info(f"[识典古籍] could not open 「{texts[todo]}」: {e}")
+                    continue
+                await asyncio.sleep(self._CHAPTER_PAUSE)
+                await read_through_current_volume()
+                logger.info(
+                    f"[识典古籍] 「{texts[todo]}」 ({len(visited)} volumes): "
+                    f"{captured()}/{expected or len(pages_by_num)} page images, "
+                    f"{len(pages_by_num)} pages listed")
 
-                if (nav + 1) % 20 == 0:
-                    logger.info(
-                        f"[识典古籍] Scroll {nav+1}: {len(image_map)}/{total_pages} image URLs captured"
-                    )
-
-            logger.info(f"[识典古籍] Captured {len(image_map)}/{total_pages} signed image URLs")
+            if refused.is_set():
+                raise DownloadError(
+                    f"[识典古籍] 读到一半站点开始拒绝请求（31000），已停止。"
+                    f"已获取 {captured()} 页，请过一段时间再试。")
+            logger.info(f"[识典古籍] Captured {len(image_map)} signed image URLs "
+                        f"for {len(pages_by_num)} listed pages")
 
         finally:
             await browser.close()
             await pw.stop()
 
+        pages_data = list(pages_by_num.values())
         # Build Resource list ordered by pageNum
         resources: List[Resource] = []
         for pg in sorted(pages_data, key=lambda x: x.get("pageNum", 0)):

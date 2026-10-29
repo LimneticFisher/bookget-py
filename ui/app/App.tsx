@@ -105,6 +105,8 @@ export const App: React.FC = () => {
   const [livePercent, setLivePercent] = useState<Record<string, number>>({});
   // Per task: building its PDF right now / where the finished PDF is.
   const [pdfBusy, setPdfBusy] = useState<Record<string, boolean>>({});
+  // 识典古籍 first pages through the reader to find every page: "found/total".
+  const [listing, setListing] = useState<Record<string, string>>({});
   const [pdfPaths, setPdfPaths] = useState<Record<string, string>>({});
 
   useEffect(() => transport.subscribe(ev => {
@@ -115,11 +117,18 @@ export const App: React.FC = () => {
       }
       const pct = Number(ev.data.percent);
       if (Number.isFinite(pct)) setLivePercent(prev => ({ ...prev, [ev.taskId]: pct }));
+      if (ev.data.phase === 'listing') {
+        const label = `${ev.data.completed}/${ev.data.total}`;
+        setListing(prev => ({ ...prev, [ev.taskId]: label }));
+      } else {
+        setListing(({ [ev.taskId]: _, ...rest }) => rest);
+      }
       return;
     }
     if (ev.type !== 'task_error' && ev.type !== 'task_completed') return;
     setLivePercent(({ [ev.taskId]: _, ...rest }) => rest);
     setPdfBusy(({ [ev.taskId]: _, ...rest }) => rest);
+    setListing(({ [ev.taskId]: _, ...rest }) => rest);
     if (ev.type === 'task_completed' && typeof ev.data.pdfPath === 'string') {
       const path = ev.data.pdfPath;
       setPdfPaths(prev => ({ ...prev, [ev.taskId]: path }));
@@ -314,6 +323,7 @@ export const App: React.FC = () => {
                   downloading={activeDownloads.has(b.taskId)}
                   error={taskErrors[b.taskId] ?? null}
                   livePercent={livePercent[b.taskId]}
+                  listing={listing[b.taskId]}
                   open={openId === b.taskId}
                   onToggle={() => setOpenId(id => (id === b.taskId ? null : b.taskId))}
                   onDownloadAll={c => download(b, undefined, c)}
@@ -366,6 +376,7 @@ interface BookRowProps {
   downloading: boolean;
   error: string | null;
   livePercent?: number;
+  listing?: string;
   dir: string;
   pdfBusy: boolean;
   pdfPath: string | null;
@@ -381,7 +392,7 @@ interface BookRowProps {
 }
 
 const BookRow: React.FC<BookRowProps> = ({
-  manifest, site, downloading, error, livePercent, open, onToggle,
+  manifest, site, downloading, error, livePercent, listing, open, onToggle,
   dir, pdfBusy, pdfPath, onBuildPdf, onReveal, ...treeProps
 }) => {
   const facts = bookFacts(manifest);
@@ -389,7 +400,9 @@ const BookRow: React.FC<BookRowProps> = ({
   const percent = downloading && livePercent != null ? Math.max(livePercent, p.percent) : p.percent;
   const done = p.total > 0 && p.completed === p.total;
   const failed = !downloading && (!!error || p.failed > 0);
-  const state = pdfBusy ? '正在生成 PDF…' : downloading ? '下载中' : done ? '已完成'
+  const state = pdfBusy ? '正在生成 PDF…'
+    : downloading && listing ? `逐页读取中 ${listing} 页（较慢，请耐心等待）`
+    : downloading ? '下载中' : done ? '已完成'
     : error ? '下载失败' : p.failed > 0 ? `${p.failed} 项失败` : '等待下载';
 
   return (
