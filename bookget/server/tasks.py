@@ -449,9 +449,13 @@ class TaskManager:
             adapter and getattr(adapter, "supports_images", False)) else 0
         got = sum(1 for r in task.resources if r.resource_type == ResourceType.IMAGE)
         if expected and got < expected:
+            # Retrying does not help: the 识典 reader only preloads the pages
+            # around where it opens, and bookget can't page through the book.
+            text_done = (dest / "text" / "full.md").is_file()
             raise RuntimeError(
-                f"图片只获取到 {got}/{expected} 页，书籍未完整下载"
-                f"（站点限制了图片列表，可稍后重试）")
+                f"图片只获取到 {got}/{expected} 页：该站阅读器只预加载开头几页，"
+                f"bookget 目前无法获取整本书的图片，重试也不会改善。"
+                + ("全文（带页码）已完整保存在 text/full.md。" if text_done else ""))
 
         manifest = DownloadManifest.load(dest / ResourceManager.MANIFEST_FILENAME)
         if manifest:
