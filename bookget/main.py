@@ -24,6 +24,25 @@ import re
 import sys
 from pathlib import Path
 
+# Packaged exe ships Chromium inside the playwright package; "0" tells
+# Playwright to look there instead of the per-user cache.
+if getattr(sys, "frozen", False):
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
+    # Windowed exe (console=False) has no usable stdout/stderr, and tqdm's
+    # progress bar then fails every download with "'NoneType' object has no
+    # attribute 'write'". Give them a sink — not open(os.devnull): on Windows
+    # NUL reports isatty() True, which makes _has_console() pick the CLI.
+    class _NullStream:
+        encoding = "utf-8"
+        def write(self, s): return len(s)
+        def flush(self): pass
+        def isatty(self): return False
+
+    for _name in ("stdout", "stderr"):
+        _s = getattr(sys, _name)
+        if _s is None or getattr(_s, "encoding", None) is None:
+            setattr(sys, _name, _NullStream())
+
 def _force_utf8(stream) -> None:
     """Best-effort switch of a std stream to UTF-8 (avoids cp1252 errors).
 

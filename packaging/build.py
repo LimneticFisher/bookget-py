@@ -62,7 +62,8 @@ def build_ui() -> None:
         "--noconfirm",
         str(PACKAGING / "ui.spec"),
     ])
-    print(f"  Output: {DIST / name}")
+    # One-dir build (bundles Chromium): ship the whole folder.
+    print(f"  Output: {DIST / 'bookget-ui' / name}")
 
 
 def main() -> None:
