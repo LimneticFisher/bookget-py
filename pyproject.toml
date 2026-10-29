@@ -50,7 +50,7 @@ tiles = [
 ]
 pdf = [
     "Pillow>=10.0",  # `bookget pdf` metadata sheet (the JPEG-embedding writer itself needs nothing)
-    "pymupdf>=1.24", # post-build verification (images byte-identical, no blank pages)
+    "pymupdf>=1.24,<2", # verification + text layer; 2.x adds onnxruntime/layout-model deps
 ]
 ia = [
     "internetarchive>=4.0",  # `bookget upload` / `ia-patch` / `ia-check`

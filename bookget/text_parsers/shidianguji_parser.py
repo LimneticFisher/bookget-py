@@ -4,7 +4,8 @@
 #   content:          JSON string → {"lines": [{"lineType": int, "content": str}, ...]}
 #   translateContent: JSON string → {"sentences": [{"content": str}, ...]}
 #
-# lineType values observed: 1 = body text, others may be headings / annotations
+# lineType values observed: 1 = body text, 4 = heading,
+#   3 = page break marker (empty content, pagePass: {"PageId": <id of the page that starts here>})
 
 import json
 from typing import List, Optional
@@ -61,6 +62,12 @@ class ShidianGujiParser(BaseTextParser):
                 chapter_paras[cid] = []
             chapter_paras[cid].append(para)
 
+        # pageId → pageNum when the caller saw the pages list; otherwise page
+        # numbers are counted on from each paragraph's startPageNum.
+        page_nums: dict[str, int] = {
+            str(k): int(v) for k, v in (meta.get("page_nums") or {}).items()}
+        tracker = _PageTracker(page_nums)
+
         # Convert each chapter's paragraphs into text strings
         chapters = []
         for ch_idx, cid in enumerate(chapter_order):
@@ -70,20 +77,36 @@ class ShidianGujiParser(BaseTextParser):
             ch_title = catalog_title.get(cid, f"第{ch_idx + 1}章")
 
             text_lines: list[str] = []
+            # [{"page", "page_id", "para", "offset"}]: page `page` starts at
+            # character `offset` of paragraphs[para].
+            page_starts: list[dict] = []
+            headings: list[int] = []
             for para in sorted(paras, key=lambda p: p.get("inChapterOrder", 0)):
-                text = _extract_paragraph_text(para)
+                text, breaks, is_heading = _paragraph_layout(para, tracker)
+                idx = len(text_lines)
+                # Breaks in an empty paragraph belong at the start of the next one.
+                page_starts.extend({**b, "para": idx, "offset": min(b["offset"], len(text))}
+                                   for b in breaks)
                 if text:
+                    if is_heading:
+                        headings.append(idx)
                     text_lines.append(text)
 
             if not text_lines:
                 continue
+            page_starts = [b for b in page_starts if b["para"] < len(text_lines)]
 
-            chapters.append({
+            chapter = {
                 "id": cid,
                 "title": ch_title,
                 "order": ch_order,
                 "paragraphs": text_lines,
-            })
+            }
+            if page_starts:
+                chapter["page_starts"] = page_starts
+            if headings:
+                chapter["headings"] = headings
+            chapters.append(chapter)
 
         # Sort chapters by chapterOrder
         chapters.sort(key=lambda c: c["order"])
@@ -115,6 +138,57 @@ class ShidianGujiParser(BaseTextParser):
             metadata=meta_dict,
             chapters=chapters,
         )
+
+
+class _PageTracker:
+    """Numbers page-break markers in reading order across the whole book."""
+
+    def __init__(self, page_nums: dict[str, int]):
+        self.page_nums = page_nums
+        self.current = 0
+
+    def paragraph_start(self, para: dict) -> None:
+        try:
+            start = int(para.get("startPageNum") or 0)
+        except (TypeError, ValueError):
+            start = 0
+        # A paragraph that starts on a later page than we've counted to means
+        # we missed markers (e.g. a paragraph we never received).
+        if start > self.current + 1 and self.current:
+            self.current = start - 1
+        self._para_start = start
+
+    def page_break(self, page_id: str) -> int:
+        num = self.page_nums.get(page_id)
+        if num is None:
+            num = self.current + 1 if self.current else (self._para_start or 1)
+        self.current = num
+        return num
+
+
+def _paragraph_layout(para: dict, tracker: "_PageTracker") -> tuple[str, list[dict], bool]:
+    """Text of a paragraph, the page breaks inside it, and whether it's a heading."""
+    tracker.paragraph_start(para)
+    content_raw = para.get("content", "")
+    try:
+        content = json.loads(content_raw) if isinstance(content_raw, str) else content_raw
+        lines = content.get("lines", [])
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return _extract_paragraph_text(para), [], False
+    text = ""
+    breaks: list[dict] = []
+    kinds: set = set()
+    for line in lines:
+        page_pass = line.get("pagePass") or {}
+        page_id = str(page_pass.get("PageId") or page_pass.get("pageId") or "")
+        if page_id:
+            breaks.append({"page": tracker.page_break(page_id), "page_id": page_id,
+                           "offset": len(text)})
+        piece = (line.get("content") or "").strip()
+        if piece:
+            text += piece
+            kinds.add(line.get("lineType"))
+    return text, breaks, bool(kinds) and kinds <= {4}
 
 
 def _extract_paragraph_text(para: dict) -> str:

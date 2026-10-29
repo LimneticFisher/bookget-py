@@ -16,6 +16,7 @@ class SearchResult:
     versions: List["SearchResult"] = field(default_factory=list)
     categories: List[str] = field(default_factory=list)
     source_site: str = ""
+    cover_url: str = ""
 
     def to_dict(self) -> dict:
         d = {
@@ -31,6 +32,8 @@ class SearchResult:
             d["versions"] = [v.to_dict() for v in self.versions]
         if self.categories:
             d["categories"] = self.categories
+        if self.cover_url:
+            d["cover_url"] = self.cover_url
         return d
 
 

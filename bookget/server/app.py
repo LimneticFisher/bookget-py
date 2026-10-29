@@ -82,9 +82,24 @@ async def run_server(
     return runner, url
 
 
+# Endpoints that touch the local machine beyond bookget's own downloads (move
+# folders, open dialogs / Explorer). CORS here allows any origin, so without
+# this any website open in the user's browser could call them.
+_LOCAL_ORIGIN_ONLY = {"/api/move-book", "/api/pick-folder", "/api/open", "/api/pdf"}
+
+
+def _is_local_origin(origin: str) -> bool:
+    from urllib.parse import urlparse
+    return urlparse(origin).hostname in ("localhost", "127.0.0.1", "::1")
+
+
 @web.middleware
 async def _cors_middleware(request: web.Request, handler):
     """Add CORS headers for local dev (allow all origins)."""
+    origin = request.headers.get("Origin")
+    if (request.path in _LOCAL_ORIGIN_ONLY and origin
+            and not _is_local_origin(origin)):
+        return web.json_response({"error": "forbidden origin"}, status=403)
     if request.method == "OPTIONS":
         return web.Response(
             headers={

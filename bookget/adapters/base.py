@@ -257,12 +257,14 @@ class BaseSiteAdapter(ABC):
             f"{self.__class__.__name__} does not implement download_node")
 
     async def _discover_from_legacy(
-        self, book_id: str, index_id: str = "",
+        self, book_id: str, index_id: str = "", list_images: bool = True,
     ) -> DownloadManifest:
         """Build a flat manifest from legacy get_image_list() + get_metadata().
 
         Used as fallback for adapters that haven't overridden
-        discover_structure().
+        discover_structure(). With list_images=False the image node is sized
+        from metadata.pages instead of calling get_image_list(), for sites
+        where listing images is slow and the download re-lists them anyway.
         """
 
         metadata = await self.get_metadata(book_id, index_id=index_id)
@@ -273,8 +275,9 @@ class BaseSiteAdapter(ABC):
             title=metadata.title,
             metadata={
                 k: v for k, v in metadata.to_dict().items()
-                if k in ("title", "creators", "dynasty", "category",
-                         "volumes", "pages", "collection_unit")
+                if k in ("title", "alt_titles", "creators", "dynasty", "date",
+                         "category", "volumes", "pages", "binding",
+                         "collection_unit", "abstract", "cover_url", "notes")
                 and v
             },
         )
@@ -290,7 +293,19 @@ class BaseSiteAdapter(ABC):
         # get_image_list() is also what PDF-only sites return their files from
         # (nlc_read, taiwan_ebook), so gating on supports_images alone made
         # those sites discover an empty manifest.
-        if self.supports_images or self.supports_pdf:
+        if (self.supports_images or self.supports_pdf) and not list_images:
+            if metadata.pages:
+                root.children.append(ManifestNode(
+                    id=f"{book_id}_images",
+                    title="Images",
+                    node_type=NodeType.VOLUME,
+                    status=NodeStatus.DISCOVERED,
+                    resource_kind=ResourceKind.IMAGE,
+                    image_count=metadata.pages,
+                    total_items=metadata.pages,
+                ))
+                root.image_count = metadata.pages
+        elif self.supports_images or self.supports_pdf:
             images = await self.get_image_list(book_id)
             if images:
                 volumes: dict[str, list] = {}

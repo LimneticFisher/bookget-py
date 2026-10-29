@@ -13,8 +13,15 @@ from typing import List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
-def verify_pdf(pdf_path, image_files: List[Path]) -> Optional[Tuple[bool, str, int, int]]:
-    """(ok, message, page_count, image_pages) or None when PyMuPDF is not installed."""
+def verify_pdf(pdf_path, image_files: List[Path],
+               expected_bytes=None) -> Optional[Tuple[bool, str, int, int]]:
+    """(ok, message, page_count, image_pages) or None when PyMuPDF is not installed.
+
+    ``expected_bytes(path)`` gives the stream each image should have been
+    embedded as; by default the file's own bytes. Non-JPEG sources (e.g.
+    识典古籍's WebP) are re-encoded to JPEG for embedding, so the builder
+    passes its encoder, otherwise such pages could never match.
+    """
     try:
         import pymupdf
     except ImportError:
@@ -36,6 +43,7 @@ def verify_pdf(pdf_path, image_files: List[Path]) -> Optional[Tuple[bool, str, i
         return False, f"{len(img_pages)} image pages, expected {n} leading content pages", d.page_count, len(img_pages)
     for i, f in zip(img_pages[:n], image_files):
         xref = d[i].get_images(full=True)[0][0]
-        if hashlib.md5(d.xref_stream_raw(xref)).hexdigest() != hashlib.md5(Path(f).read_bytes()).hexdigest():
+        want = expected_bytes(Path(f)) if expected_bytes else Path(f).read_bytes()
+        if hashlib.md5(d.xref_stream_raw(xref)).hexdigest() != hashlib.md5(want).hexdigest():
             return False, f"page {i + 1} image differs from {Path(f).name}", d.page_count, len(img_pages)
     return True, "OK", d.page_count, len(img_pages)

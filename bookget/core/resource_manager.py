@@ -123,6 +123,7 @@ class ResourceManager:
                 await self._download_images(
                     task, adapter, img_dir, progress_callback
                 )
+                self._save_page_layout(task, adapter, dest_dir)
 
             # Get and save text (raw API response + optional conversions)
             if include_text and adapter.supports_text:
@@ -152,6 +153,9 @@ class ResourceManager:
                         encoding="utf-8",
                     )
                     logger.info(f"Saved raw text data to: {raw_path}")
+                    self._save_readable_text(structured.to_dict(), text_dir)
+                    # The text pass sees more of the reader, hence more boxes.
+                    self._save_page_layout(task, adapter, dest_dir)
                 else:
                     # Fallback: try old get_text_content for adapters without structured support
                     text_content = await adapter.get_text_content(book_id)
@@ -166,6 +170,35 @@ class ResourceManager:
 
         finally:
             await adapter.close()
+
+    @staticmethod
+    def _save_readable_text(data: dict, text_dir: Path) -> None:
+        """Write full.md / full.txt next to the raw JSON (with page markers
+        when the site reported page breaks)."""
+        from ..text_converters import MarkdownConverter, PlainTextConverter
+        try:
+            (text_dir / "full.md").write_text(MarkdownConverter().convert(data), encoding="utf-8")
+            (text_dir / "full.txt").write_text(PlainTextConverter().convert(data), encoding="utf-8")
+        except Exception as e:  # readable copies are a convenience
+            logger.warning(f"Could not write full.md/full.txt: {e}")
+
+    @staticmethod
+    def _save_page_layout(task, adapter, dest_dir: Path) -> None:
+        """Save per-character boxes (page_layout.json) for adapters that have them."""
+        layout_fn = getattr(adapter, "page_text_layer", None)
+        if not layout_fn or not task.resources:
+            return
+        names = {}
+        for r in task.resources:
+            try:
+                names[int(r.order)] = r.get_filename()
+            except (TypeError, ValueError):
+                pass
+        layout = layout_fn(names)
+        if layout:
+            path = dest_dir / "page_layout.json"
+            path.write_text(json.dumps(layout, ensure_ascii=False), encoding="utf-8")
+            logger.info(f"Saved character boxes for {len(layout['pages'])} pages: {path}")
 
     async def _download_images(
         self,

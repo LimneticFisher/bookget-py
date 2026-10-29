@@ -39,7 +39,7 @@ def pdf_filename(md: Dict, prefix: str = "") -> str:
     return file_stem(md, prefix) + ".pdf"
 
 
-def _as_jpeg(path: Path) -> bytes:
+def _as_jpeg(path: Path, quiet: bool = False) -> bytes:
     data = path.read_bytes()
     if data[:2] == b"\xff\xd8":
         return data
@@ -47,7 +47,8 @@ def _as_jpeg(path: Path) -> bytes:
         from PIL import Image
     except ImportError:
         raise RuntimeError(f"{path.name} is not a JPEG and Pillow is not installed (pip install bookget[pdf])")
-    logger.warning(f"Re-encoding non-JPEG page {path.name} (quality 95)")
+    if not quiet:
+        logger.warning(f"Re-encoding non-JPEG page {path.name} (quality 95)")
     im = Image.open(path)
     if im.mode not in ("RGB", "L"):
         im = im.convert("RGB")
@@ -142,9 +143,27 @@ def _build_native(m: Dict, book_dir: Path, out_path: Path, dpi: float, sheet: bo
     return out_path
 
 
+def _add_text_layer(m: Dict, book_dir: Path, out_path: Path, font_path: Optional[str]) -> None:
+    """Searchable text over the scans when the download saved character boxes."""
+    from .text_layer import add_text_layer, load_layout
+    if not load_layout(book_dir):
+        return
+    fp = font_path or find_cjk_font()
+    if not fp:
+        logger.warning("No CJK font found; text layer skipped (set BOOKGET_CJK_FONT)")
+        return
+    try:
+        n = add_text_layer(out_path, book_dir, [p["file"] for p in m["pages"]], fp)
+    except ImportError:
+        logger.warning("PyMuPDF not installed; text layer skipped (pip install bookget[pdf])")
+        return
+    logger.info(f"text layer: {n}/{len(m['pages'])} pages searchable")
+
+
 def build_book_pdf(book_dir, out_path=None, *, engine: str = "native", sheet: bool = True, reverse: bool = False,
                    dpi: float = 300.0, name_prefix: Optional[str] = None, sheet_dpi: int = 200,
-                   font_path: Optional[str] = None, verify: bool = True, keep_build: bool = False) -> Path:
+                   font_path: Optional[str] = None, verify: bool = True, keep_build: bool = False,
+                   text_layer: bool = True) -> Path:
     """Build the PDF for one downloaded book directory; returns the output path.
 
     ``engine`` is ``native`` (default) or ``latex``. ``name_prefix`` defaults to
@@ -164,8 +183,12 @@ def build_book_pdf(book_dir, out_path=None, *, engine: str = "native", sheet: bo
         build_latex_pdf(m, book_dir, out_path, dpi=dpi, keep_build=keep_build)
     else:
         _build_native(m, book_dir, out_path, dpi, sheet, sheet_dpi, font_path)
+        if text_layer:
+            _add_text_layer(m, book_dir, out_path, font_path)
     if verify:
-        res = verify_pdf(out_path, [book_dir / p["file"] for p in m["pages"]])
+        # The native engine embeds _as_jpeg(); the LaTeX engine embeds files as-is.
+        expected = (lambda f: _as_jpeg(f, quiet=True)) if engine == "native" else None
+        res = verify_pdf(out_path, [book_dir / p["file"] for p in m["pages"]], expected)
         if res is None:
             logger.warning("PyMuPDF not installed; skipping verification (pip install bookget[pdf])")
         elif not res[0]:

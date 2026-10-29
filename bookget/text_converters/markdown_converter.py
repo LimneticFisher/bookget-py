@@ -1,5 +1,7 @@
 """Convert structured JSON to Markdown format."""
 
+from .pages import PAGE_MARK, paragraphs_with_pages
+
 
 class MarkdownConverter:
     """Convert StructuredText dict to Markdown."""
@@ -45,10 +47,13 @@ class MarkdownConverter:
                 lines.append(f"## {ch_title}")
                 lines.append("")
 
-            for para in ch.get("paragraphs", []):
-                text = str(para).strip()
+            headings = set(ch.get("headings", []))
+            for i, (pages, text) in enumerate(paragraphs_with_pages(ch)):
+                if pages:
+                    lines.append(" ".join(f"*{PAGE_MARK.format(n)}*" for n in pages))
+                    lines.append("")
                 if text:
-                    lines.append(text)
+                    lines.append(f"### {text}" if i in headings else text)
                     lines.append("")
 
         return "\n".join(lines)

@@ -1,5 +1,7 @@
 """Convert structured JSON to plain text format."""
 
+from .pages import PAGE_MARK, paragraphs_with_pages
+
 
 class PlainTextConverter:
     """Convert StructuredText dict to plain text (no markup)."""
@@ -21,8 +23,9 @@ class PlainTextConverter:
                 lines.append(ch_title)
                 lines.append("")
 
-            for para in ch.get("paragraphs", []):
-                text = str(para).strip()
+            for pages, text in paragraphs_with_pages(ch):
+                if pages:
+                    lines.append("".join(PAGE_MARK.format(n) for n in pages))
                 if text:
                     lines.append(text)
             lines.append("")

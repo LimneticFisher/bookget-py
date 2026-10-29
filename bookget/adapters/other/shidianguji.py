@@ -80,11 +80,24 @@ class ShidianGujiAdapter(BaseSiteAdapter):
         "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     )
 
+    # How long to wait for the reader's XHRs after the page loads. Was 20s,
+    # which failed outright on slow links (e.g. from Taiwan the page itself
+    # takes ~30s and the API lands well after).
+    _API_WAIT = 60.0
+
     def __init__(self, config=None):
         super().__init__(config)
         self._pw = None
         self._browser = None
         self._context = None
+        # discover() asks for metadata twice (structure + metadata.json);
+        # each call is a full browser page load, so remember the answer.
+        self._metadata_cache: dict[str, BookMetadata] = {}
+        # Page layout the reader loads on its own while we drive it: pageId →
+        # pageNum, and pageId → per-character boxes (word_box API). Only what
+        # the page itself requests is recorded; nothing is fetched for it.
+        self._page_nums: dict[str, int] = {}
+        self._word_boxes: dict[str, list] = {}
 
     def _check_playwright(self):
         if not HAS_PLAYWRIGHT:
@@ -124,22 +137,10 @@ class ShidianGujiAdapter(BaseSiteAdapter):
         were all verified working headless (2026-09-19). The real cause of
         "识典失效" was the paragraphs endpoint moving v2 → v3, not headlessness.
         """
-        if self._browser and self._browser.is_connected():
+        if self._context is not None:
             return
-        self._check_playwright()
-        self._pw = await async_playwright().start()
-        try:
-            self._browser = await self._pw.chromium.launch(headless=True)
-        except Exception as e:
-            await self._pw.stop()
-            self._pw = None
-            raise DownloadError(
-                "Chromium 浏览器未安装。请运行: playwright install chromium"
-            ) from e
-        self._context = await self._browser.new_context(
-            user_agent=self._USER_AGENT,
-            viewport={"width": 1280, "height": 900},
-        )
+        # Same launcher (and user agent / viewport) as the one-shot calls.
+        self._pw, self._browser, self._context = await self._launch_browser()
 
     async def _close_browser(self):
         """Close the persistent browser instance."""
@@ -161,7 +162,10 @@ class ShidianGujiAdapter(BaseSiteAdapter):
         """Start Playwright, launch Chromium, return (pw, browser, context).
 
         Used by get_metadata / get_image_list / get_structured_text which
-        manage their own browser lifecycle.
+        manage their own browser lifecycle. Always a fresh, empty browser (as
+        upstream bookget does): a persistent profile made repeat parses faster
+        by caching the site's scripts, but it got flagged as automated and
+        every request from it was refused (errorCode 31000).
         """
         self._check_playwright()
         pw = await async_playwright().start()
@@ -182,11 +186,8 @@ class ShidianGujiAdapter(BaseSiteAdapter):
     # Metadata
     # ------------------------------------------------------------------
 
-    async def get_metadata(self, book_id: str, index_id: str = "") -> BookMetadata:
-        """Fetch book metadata by intercepting the reader-book API."""
-        self._check_playwright()
-
-        book_info: dict = {}
+    async def _fetch_book_info(self, book_id: str, book_info: dict) -> None:
+        """One browser page load; fills book_info from the reader-book API."""
         api_done = asyncio.Event()
 
         pw, browser, context = await self._launch_browser()
@@ -205,24 +206,106 @@ class ShidianGujiAdapter(BaseSiteAdapter):
 
             page.on("response", on_response)
             book_url = f"{self.BASE_URL}/zh/book/{book_id}"
+            # Don't wait for the page to finish: the API often lands first.
+            goto = asyncio.ensure_future(
+                page.goto(book_url, wait_until="domcontentloaded", timeout=90000))
             try:
-                await page.goto(book_url, wait_until="domcontentloaded", timeout=60000)
-            except Exception as e:
-                logger.warning(f"Page.goto: {e}")
-
-            try:
-                await asyncio.wait_for(api_done.wait(), timeout=20.0)
+                await asyncio.wait_for(api_done.wait(), timeout=90.0)
             except asyncio.TimeoutError:
                 logger.warning(f"Timeout waiting for metadata API for {book_id}")
-
+            if not goto.done():
+                goto.cancel()
+            try:
+                await goto
+            except BaseException as e:  # cancelled or navigation error
+                if not book_info:
+                    logger.warning(f"Page.goto: {e!r}")
         finally:
             await browser.close()
             await pw.stop()
 
+    async def discover_structure(
+        self, book_id: str, index_id: str = "", depth: int = 1,
+        progress_callback: Callable[[str, str], None] = None,
+    ):
+        """Metadata-only manifest, so the preview appears in seconds.
+
+        Listing images means scrolling the reader through every page (minutes
+        for a few hundred pages), and the URLs are short-lived signed links
+        the whole-book download collects again anyway.
+        """
+        return await self._discover_from_legacy(book_id, index_id, list_images=False)
+
+    _WORD_BOX_API = "/api/ancientlib/read/word_box/page_content"
+    _PAGES_API = "/api/ancientlib/read/book/pages/v"
+
+    async def _record_layout(self, response) -> None:
+        """Keep page numbers and character boxes from reader responses."""
+        url = response.url
+        if self._WORD_BOX_API not in url and self._PAGES_API not in url:
+            return
+        try:
+            data = await response.json()
+        except Exception:
+            return
+        if data.get("errorCode") != 0:
+            return
+        payload = data.get("data") or {}
+        for pg in payload.get("pages", []):
+            try:
+                self._page_nums[str(pg["pageId"])] = int(pg["pageNum"])
+            except (KeyError, TypeError, ValueError):
+                pass
+        for pid, content in (payload.get("pageId2WordBoxContent") or {}).items():
+            boxes = (content or {}).get("wordBoxList") or []
+            if boxes:
+                self._word_boxes[str(pid)] = boxes
+
+    def page_text_layer(self, filenames: dict[int, str]) -> Optional[dict]:
+        """Character boxes per downloaded page image, for the PDF text layer.
+
+        filenames maps pageNum → image filename. Coordinates are pixels of
+        that image. Returns None when no boxes were seen.
+        """
+        pages = {}
+        for pid, boxes in self._word_boxes.items():
+            num = self._page_nums.get(pid)
+            name = filenames.get(num) if num is not None else None
+            if not name:
+                continue
+            pages[name] = {
+                "page": num,
+                "chars": [
+                    {"t": b.get("charText", ""), "line": b.get("textlineId", 0),
+                     "poly": [b["charPoly"][k] for k in
+                              ("x0", "y0", "x1", "y1", "x2", "y2", "x3", "y3")]}
+                    for b in boxes
+                    if b.get("charText") and b.get("charPoly") and not b.get("isPicText")
+                ],
+            }
+        return {"source": self.site_id, "units": "image_px", "pages": pages} if pages else None
+
+    async def get_metadata(self, book_id: str, index_id: str = "") -> BookMetadata:
+        """Fetch book metadata by intercepting the reader-book API."""
+        if book_id in self._metadata_cache:
+            return self._metadata_cache[book_id]
+        self._check_playwright()
+
+        book_info: dict = {}
+        # The page can be very slow from outside the mainland, and the API
+        # sometimes never fires on the first load; one retry recovers most.
+        for attempt in range(2):
+            await self._fetch_book_info(book_id, book_info)
+            if book_info:
+                break
+            logger.warning(f"[识典古籍] metadata attempt {attempt + 1} failed for {book_id}")
+
         if not book_info:
             raise MetadataExtractionError(f"Failed to get metadata for {book_id}")
 
-        return self._parse_metadata(book_info, book_id)
+        metadata = self._parse_metadata(book_info, book_id)
+        self._metadata_cache[book_id] = metadata
+        return metadata
 
     def _parse_metadata(self, info: dict, book_id: str) -> BookMetadata:
         """Convert bookInfo API dict to BookMetadata."""
@@ -274,6 +357,11 @@ class ShidianGujiAdapter(BaseSiteAdapter):
         if edition and edition.get("edition"):
             metadata.notes.append(f"版本: {edition['edition']}")
 
+        # Scanned cover first; the designed "beautiful" cover as fallback.
+        metadata.cover_url = info.get("coverUrl") or info.get("beautifulCover") or ""
+        if isinstance(info.get("abstract"), str):
+            metadata.abstract = info["abstract"].strip()
+
         metadata.raw_metadata = info
         return metadata
 
@@ -312,6 +400,7 @@ class ShidianGujiAdapter(BaseSiteAdapter):
                         image_map[uri] = url
 
             async def on_response(response):
+                await self._record_layout(response)
                 if "/api/ancientlib/read/book/pages/v3/" in response.url:
                     try:
                         data = await response.json()
@@ -333,7 +422,7 @@ class ShidianGujiAdapter(BaseSiteAdapter):
 
             # Wait for pages list API
             try:
-                await asyncio.wait_for(pages_event.wait(), timeout=20.0)
+                await asyncio.wait_for(pages_event.wait(), timeout=self._API_WAIT)
             except asyncio.TimeoutError:
                 logger.warning(f"Timeout waiting for pages API for {book_id}")
 
@@ -445,6 +534,7 @@ class ShidianGujiAdapter(BaseSiteAdapter):
 
             async def on_response(response):
                 url = response.url
+                await self._record_layout(response)
                 if "/api/ancientlib/read/reader-book/get/" in url:
                     try:
                         data = await response.json()
@@ -569,6 +659,7 @@ class ShidianGujiAdapter(BaseSiteAdapter):
             "authors_json": book_info.get("authors", "[]"),
             "dynasty": book_info.get("dynastyCategoryName", ""),
             "catalog": catalog if isinstance(catalog, list) else [],
+            "page_nums": dict(self._page_nums),
         }
         return parser.parse(all_paragraphs, book_id, url, meta)
 
@@ -600,12 +691,14 @@ class ShidianGujiAdapter(BaseSiteAdapter):
             authors = b.get("authors", [])
             dynasty = b.get("dynastyCategoryName", "")
             author_str = self._format_authors(authors)
-            snippet = f"（{dynasty}）{author_str}" if dynasty else author_str
+            snippet = b.get("_snippet") or (
+                f"（{dynasty}）{author_str}" if dynasty else author_str)
             results.append(SearchResult(
                 title=book_name,
                 url=f"{self.BASE_URL}/book/{book_id}" if book_id else "",
                 snippet=snippet,
                 source_site=self.site_id,
+                cover_url=b.get("coverUrl") or "",
             ))
 
         return SearchResponse(
@@ -647,9 +740,14 @@ class ShidianGujiAdapter(BaseSiteAdapter):
                             for item in book_list:
                                 book = item.get("book", item)
                                 search_results.append(book)
-                            api_done.set()
+                        else:
+                            # e.g. 31000: the endpoint now rejects automated
+                            # clients; fall back to the page's 相关书籍 below.
+                            logger.info(f"[识典古籍] book search API errorCode "
+                                        f"{data.get('errorCode')}")
                     except Exception:
-                        api_done.set()
+                        pass
+                    api_done.set()
 
             page.on("response", on_response)
 
@@ -658,35 +756,67 @@ class ShidianGujiAdapter(BaseSiteAdapter):
             logger.debug(f"[识典古籍] Searching: {search_url}")
             try:
                 await page.goto(
-                    search_url, wait_until="domcontentloaded", timeout=30000
+                    search_url, wait_until="domcontentloaded", timeout=90000
                 )
             except Exception as e:
                 logger.warning(f"[识典古籍] Search page.goto: {e}")
 
-            # Wait for JS to initialize the search UI before clicking
-            await asyncio.sleep(1)
-
+            # The click below waits for the tab to render; the site's scripts
+            # can take a minute to arrive from outside the mainland.
             # Click the "搜书籍" tab to trigger the book search API
             try:
                 book_tab = page.locator(
                     'div.semi-tabs-tab:has-text("搜书籍")'
                 )
-                await book_tab.click(timeout=5000)
+                await book_tab.click(timeout=self._API_WAIT * 1000)
             except Exception as e:
                 logger.warning(f"[识典古籍] Could not click book tab: {e}")
 
             try:
-                await asyncio.wait_for(api_done.wait(), timeout=30.0)
+                await asyncio.wait_for(api_done.wait(), timeout=self._API_WAIT)
             except asyncio.TimeoutError:
                 logger.warning(
                     f"[识典古籍] Timeout waiting for book search API "
                     f"for '{query}'"
                 )
 
+            if not search_results:
+                search_results.extend(await self._related_books(page))
+
         finally:
             await page.close()
 
         return search_results
+
+    # The full-text tab (shown first) carries a 「相关书籍」 box rendered into
+    # the page, with no API call to intercept.
+    _RELATED_BOOKS_JS = """() => [...document.querySelectorAll('a.recommend-item')].map(a => ({
+        href: a.getAttribute('href') || '',
+        name: (a.querySelector('.recommend-item__name') || {}).innerText || '',
+        info: (a.querySelector('.recommend-item__info') || {}).innerText || '',
+        cover: (a.querySelector('img') || {}).src || '',
+    }))"""
+
+    async def _related_books(self, page) -> list[dict]:
+        """Books from the search page's 相关书籍 box, in the API's dict shape."""
+        try:
+            await page.locator("a.recommend-item").first.wait_for(timeout=15000)
+            items = await page.evaluate(self._RELATED_BOOKS_JS)
+        except Exception as e:
+            logger.info(f"[识典古籍] no 相关书籍 on search page: {e}")
+            return []
+        books = []
+        for it in items:
+            m = re.search(r"/book/([A-Za-z0-9_]+)", it.get("href", ""))
+            if not m:
+                continue
+            books.append({
+                "bookId": m.group(1),
+                "bookName": it.get("name", "").strip(),
+                "_snippet": " ".join(it.get("info", "").split()),
+                "coverUrl": it.get("cover", ""),
+            })
+        return books
 
     @staticmethod
     def _format_authors(authors) -> str:

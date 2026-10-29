@@ -104,6 +104,8 @@ class BookMetadata:
     doi: str = ""                   # DOI
 
     # Additional
+    abstract: str = ""              # 内容简介
+    cover_url: str = ""             # 封面图 (may be a short-lived signed URL)
     notes: List[str] = field(default_factory=list)
     provenance: List[str] = field(default_factory=list)    # 批校题跋
     subjects: List[str] = field(default_factory=list)       # 主题
@@ -148,6 +150,8 @@ class BookMetadata:
             "collection_unit": self.collection_unit,
             "call_number": self.call_number,
             "doi": self.doi,
+            "abstract": self.abstract,
+            "cover_url": self.cover_url,
             "notes": self.notes,
             "provenance": self.provenance,
             "subjects": self.subjects,
