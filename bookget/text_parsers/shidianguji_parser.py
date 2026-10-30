@@ -48,6 +48,9 @@ class ShidianGujiParser(BaseTextParser):
             for item in catalog:
                 cid = str(item.get("chapterId") or item.get("id", ""))
                 ctitle = item.get("title") or item.get("name") or ""
+                if not ctitle and isinstance(item.get("chapterName"), list):
+                    ctitle = "".join(str(x.get("content", "")) for x in item["chapterName"]
+                                     if isinstance(x, dict))
                 if cid:
                     catalog_title[cid] = ctitle
 

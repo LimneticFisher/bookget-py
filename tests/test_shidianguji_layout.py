@@ -108,3 +108,38 @@ def test_text_layer_is_searchable(fx, tmp_path):
     s = doc[0].rect.width / 817
     assert abs(r.x0 / s - 687) < 6 and abs(r.x1 / s - 776) < 6
     assert abs(r.y0 / s - 204) < 6 and abs(r.y1 / s - 269) < 6
+
+
+class _Resp:
+    def __init__(self, url, data):
+        self.url, self._data = url, data
+
+    async def json(self):
+        return self._data
+
+
+def test_records_current_reader_apis(fx):
+    """Book info, paragraphs and boxes from the endpoints the reader uses now
+    (word-box-page-content/m-get since 2026-10; catalog as {"chapters": …})."""
+    import asyncio
+    api = "https://www.shidianguji.com/api/ancientlib/read/"
+    catalog = {"chapters": [
+        {"chapterId": "c1", "chapterName": [{"content": "論語序"}], "paragraphCount": len(fx["paragraphs"]),
+         "subChapters": [{"chapterId": "c2", "chapterName": [{"content": "學而"}], "paragraphCount": 5}]}]}
+    a = ShidianGujiAdapter()
+
+    async def feed():
+        await a._record_layout(_Resp(api + "reader-book/get/?x", {
+            "errorCode": 0, "data": {"bookInfo": {"bookName": "論語", "catalog": json.dumps(catalog)}}}))
+        await a._record_layout(_Resp(api + "book/paragraphs/v3/?x", {
+            "errorCode": 0, "data": {"paragraphs": fx["paragraphs"], "totalParaNum": len(fx["paragraphs"])}}))
+        await a._record_layout(_Resp(api + "book/pages/v3/?x", {"errorCode": 0, "data": {"pages": fx["pages"]}}))
+        await a._record_layout(_Resp(api + "word-box-page-content/m-get/?x", {
+            "errorCode": 0, "data": {"pageId2WordBoxContent": fx["word_boxes"]}}))
+    asyncio.run(feed())
+
+    assert [c["title"] for c in a._catalog_chapters(a._book_info)] == ["論語序", "學而"]
+    # The whole book has 5 more paragraphs than this chapter: not complete yet.
+    assert a._expected_paragraphs() == len(fx["paragraphs"]) + 5
+    assert len(a._paragraphs) == len(fx["paragraphs"]) and not a._text_complete()
+    assert a.page_text_layer({3: "0003.webp"})["pages"]["0003.webp"]["chars"]

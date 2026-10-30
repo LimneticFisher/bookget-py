@@ -71,8 +71,9 @@ class ShidianGujiAdapter(BaseSiteAdapter):
 
     # How long to wait for the reader's XHRs after the page loads. Was 20s,
     # which failed outright on slow links (e.g. from Taiwan the page itself
-    # takes ~30s and the API lands well after).
-    _API_WAIT = 60.0
+    # takes ~30s and the API lands well after; in 2026-10 the reader's first
+    # responses took 75–95s).
+    _API_WAIT = 120.0
 
     def __init__(self, config=None):
         super().__init__(config)
@@ -87,6 +88,12 @@ class ShidianGujiAdapter(BaseSiteAdapter):
         # the page itself requests is recorded; nothing is fetched for it.
         self._page_nums: dict[str, int] = {}
         self._word_boxes: dict[str, list] = {}
+        # Paragraphs (paragraphId → paragraph) and bookInfo the reader loaded
+        # while get_image_list read the book, so the text step can reuse them
+        # instead of reading the whole book a second time.
+        self._paragraphs: dict[str, dict] = {}
+        self._book_info: dict = {}
+        self._read_book_id = ""
 
     def _check_playwright(self):
         if not HAS_PLAYWRIGHT:
@@ -235,13 +242,19 @@ class ShidianGujiAdapter(BaseSiteAdapter):
         """
         return await self._discover_from_legacy(book_id, index_id, list_images=False)
 
-    _WORD_BOX_API = "/api/ancientlib/read/word_box/page_content"
+    # Character boxes: word_box/page_content until 2026-10, now
+    # word-box-page-content/m-get (same payload).
+    _WORD_BOX_API_RE = re.compile(r"/api/ancientlib/read/word[-_]box")
     _PAGES_API = "/api/ancientlib/read/book/pages/v"
+    _BOOK_INFO_API = "/api/ancientlib/read/reader-book/get/"
 
     async def _record_layout(self, response) -> None:
-        """Keep page numbers and character boxes from reader responses."""
+        """Keep book info, paragraphs, page numbers and character boxes from
+        the reader's own responses."""
         url = response.url
-        if self._WORD_BOX_API not in url and self._PAGES_API not in url:
+        is_paragraphs = bool(self._PARAGRAPHS_API_RE.search(url))
+        if not (self._WORD_BOX_API_RE.search(url) or self._PAGES_API in url
+                or self._BOOK_INFO_API in url or is_paragraphs):
             return
         try:
             data = await response.json()
@@ -250,6 +263,13 @@ class ShidianGujiAdapter(BaseSiteAdapter):
         if data.get("errorCode") != 0:
             return
         payload = data.get("data") or {}
+        if self._BOOK_INFO_API in url:
+            self._book_info.update(payload.get("bookInfo") or {})
+        if is_paragraphs:
+            for p in payload.get("paragraphs") or []:
+                pid = str(p.get("paragraphId", ""))
+                if pid:
+                    self._paragraphs.setdefault(pid, p)
         for pg in payload.get("pages", []):
             try:
                 self._page_nums[str(pg["pageId"])] = int(pg["pageNum"])
@@ -259,6 +279,93 @@ class ShidianGujiAdapter(BaseSiteAdapter):
             boxes = (content or {}).get("wordBoxList") or []
             if boxes:
                 self._word_boxes[str(pid)] = boxes
+
+    @staticmethod
+    def _catalog_chapters(book_info: dict) -> list[dict]:
+        """bookInfo.catalog as a flat chapter list (sub-chapters included).
+
+        The catalog is a JSON string or object, either a list of chapters or
+        {"chapters": [...]}; chapterName is a list of {"content": …} runs.
+        """
+        cat = book_info.get("catalog") or []
+        if isinstance(cat, str):
+            try:
+                cat = json.loads(cat)
+            except ValueError:
+                cat = []
+        if isinstance(cat, dict):
+            cat = cat.get("chapters") or []
+        out: list[dict] = []
+
+        def walk(items):
+            for ch in items or []:
+                if not isinstance(ch, dict):
+                    continue
+                name = ch.get("chapterName")
+                if isinstance(name, list):
+                    name = "".join(str(x.get("content", "")) for x in name if isinstance(x, dict))
+                out.append({**ch, "title": ch.get("title") or name or ""})
+                walk(ch.get("subChapters"))
+        walk(cat if isinstance(cat, list) else [])
+        return out
+
+    def _expected_paragraphs(self) -> int:
+        """Paragraphs in the whole book per the catalog (0 when unknown)."""
+        return sum(int(ch.get("paragraphCount") or 0) for ch in self._catalog_chapters(self._book_info))
+
+    def _text_complete(self) -> bool:
+        expected = self._expected_paragraphs()
+        return bool(expected) and len(self._paragraphs) >= expected
+
+    async def _read_volumes(self, page, done: Callable[[], bool], refused: asyncio.Event,
+                            report: Callable[[], None] = None,
+                            status: Callable[[], str] = None) -> None:
+        """Open each volume from the table of contents and scroll its text to
+        the end, slowly, so the reader loads that volume's pages, images,
+        paragraphs and character boxes by itself. Stops when done() is true or
+        the site starts refusing requests."""
+
+        async def read_through_current_volume() -> None:
+            stuck = 0
+            while stuck < 2 and not refused.is_set():
+                moved = await page.evaluate(self._SCROLL_TEXT_JS,
+                                            [self._TEXT_PANE, self._SCROLL_STEP])
+                await asyncio.sleep(self._SCROLL_PAUSE)
+                stuck = 0 if moved else stuck + 1
+                if report:
+                    report()
+                if done():
+                    return
+
+        await asyncio.sleep(self._CHAPTER_PAUSE)
+        await read_through_current_volume()
+
+        # The table of contents is a virtualised list: only the items in
+        # view exist in the DOM, so scroll it to reveal the rest.
+        toc = page.locator(self._TOC_ITEM)
+        texts = await toc.all_inner_texts()
+        visited = {texts[0]} if texts else set()
+        logger.info("[识典古籍] reading the book volume by volume, slowly")
+        while not refused.is_set() and not done():
+            texts = await toc.all_inner_texts()
+            todo = next((i for i, t in enumerate(texts) if t not in visited), None)
+            if todo is None:
+                before = texts
+                await page.evaluate(self._SCROLL_TEXT_JS, [self._TOC_LIST, 0.8])
+                await asyncio.sleep(1.5)
+                if await toc.all_inner_texts() == before:
+                    break                       # end of the table of contents
+                continue
+            visited.add(texts[todo])
+            try:
+                await toc.nth(todo).click(timeout=15000)
+            except Exception as e:
+                logger.info(f"[识典古籍] could not open 「{texts[todo]}」: {e}")
+                continue
+            await asyncio.sleep(self._CHAPTER_PAUSE)
+            await read_through_current_volume()
+            logger.info(f"[识典古籍] 「{texts[todo]}」 ({len(visited)} volumes): "
+                        + (status() if status else ""))
 
     def page_text_layer(self, filenames: dict[int, str]) -> Optional[dict]:
         """Character boxes per downloaded page image, for the PDF text layer.
@@ -478,56 +585,27 @@ class ShidianGujiAdapter(BaseSiteAdapter):
                     except Exception:
                         pass
 
-            async def read_through_current_volume() -> None:
-                """Scroll the text pane to the end, slowly."""
-                stuck = 0
-                while stuck < 2 and not refused.is_set():
-                    moved = await page.evaluate(self._SCROLL_TEXT_JS,
-                                                [self._TEXT_PANE, self._SCROLL_STEP])
-                    await asyncio.sleep(self._SCROLL_PAUSE)
-                    stuck = 0 if moved else stuck + 1
-                    report()
-                    if expected and captured() >= expected:
-                        return
+            # Keep reading until the text is complete too, so the text step
+            # can reuse what was loaded here.
+            def done() -> bool:
+                return bool(expected) and captured() >= expected and self._text_complete()
 
-            await asyncio.sleep(self._CHAPTER_PAUSE)
-            await read_through_current_volume()
+            def status() -> str:
+                return (f"{captured()}/{expected or len(pages_by_num)} page images, "
+                        f"{len(pages_by_num)} pages listed, "
+                        f"{len(self._paragraphs)}/{self._expected_paragraphs() or '?'} paragraphs, "
+                        f"{len(self._word_boxes)} pages with character boxes")
 
-            # The table of contents is a virtualised list: only the items in
-            # view exist in the DOM, so scroll it to reveal the rest.
-            toc = page.locator(self._TOC_ITEM)
-            texts = await toc.all_inner_texts()
-            visited = {texts[0]} if texts else set()
-            logger.info("[识典古籍] reading the book volume by volume, slowly")
-            while not refused.is_set() and not (expected and captured() >= expected):
-                texts = await toc.all_inner_texts()
-                todo = next((i for i, t in enumerate(texts) if t not in visited), None)
-                if todo is None:
-                    before = texts
-                    await page.evaluate(self._SCROLL_TEXT_JS, [self._TOC_LIST, 0.8])
-                    await asyncio.sleep(1.5)
-                    if await toc.all_inner_texts() == before:
-                        break                       # end of the table of contents
-                    continue
-                visited.add(texts[todo])
-                try:
-                    await toc.nth(todo).click(timeout=15000)
-                except Exception as e:
-                    logger.info(f"[识典古籍] could not open 「{texts[todo]}」: {e}")
-                    continue
-                await asyncio.sleep(self._CHAPTER_PAUSE)
-                await read_through_current_volume()
-                logger.info(
-                    f"[识典古籍] 「{texts[todo]}」 ({len(visited)} volumes): "
-                    f"{captured()}/{expected or len(pages_by_num)} page images, "
-                    f"{len(pages_by_num)} pages listed")
+            await self._read_volumes(page, done, refused, report, status)
+            if self._paragraphs:
+                self._read_book_id = book_id
 
             if refused.is_set():
                 raise DownloadError(
                     f"[识典古籍] 读到一半站点开始拒绝请求（31000），已停止。"
                     f"已获取 {captured()} 页，请过一段时间再试。")
             logger.info(f"[识典古籍] Captured {len(image_map)} signed image URLs "
-                        f"for {len(pages_by_num)} listed pages")
+                        f"for {len(pages_by_num)} listed pages; " + status())
 
         finally:
             await browser.close()
@@ -574,152 +652,107 @@ class ShidianGujiAdapter(BaseSiteAdapter):
         """
         Collect paragraph text for all chapters.
 
-        Navigates through the reader to trigger the paragraphs API calls
-        (v3 at time of writing; matched version-agnostically).
-        Text content is unencrypted (contentEncryptType: 0).
+        Reuses the paragraphs the reader loaded while get_image_list read the
+        book. Otherwise opens the reader and reads it volume by volume the
+        same way, recording the paragraphs API responses (v3 at time of
+        writing; matched version-agnostically). Text is unencrypted
+        (contentEncryptType: 0).
         """
         self._check_playwright()
 
-        all_paragraphs: list[dict] = []
-        paragraphs_seen: set[str] = set()
-        chapters_seen: set[str] = set()
-        book_info: dict = {}
-        total_from_api: dict = {}
+        if self._read_book_id != book_id or not self._text_complete():
+            await self._read_text(book_id, progress_callback)
 
-        pw, browser, context = await self._launch_browser()
-        try:
-            page = await context.new_page()
+        paragraphs = list(self._paragraphs.values())
+        expected = self._expected_paragraphs()
+        logger.info(f"[识典古籍] Collected {len(paragraphs)}/{expected or '?'} paragraphs "
+                    f"from {len({str(p.get('chapterId', '')) for p in paragraphs})} chapters")
 
-            async def on_response(response):
-                url = response.url
-                await self._record_layout(response)
-                if "/api/ancientlib/read/reader-book/get/" in url:
-                    try:
-                        data = await response.json()
-                        if data.get("errorCode") == 0:
-                            book_info.update(data["data"].get("bookInfo", {}))
-                    except Exception:
-                        pass
-                elif self._PARAGRAPHS_API_RE.search(url):
-                    try:
-                        data = await response.json()
-                        if data.get("errorCode") == 0:
-                            payload = data["data"]
-                            # v3 reports the real total here; prefer it over the
-                            # paragraphCount in bookInfo, which counts differently.
-                            total = payload.get("totalParaNum")
-                            if total:
-                                try:
-                                    total_from_api["n"] = int(total)
-                                except (TypeError, ValueError):
-                                    pass
-                            paras = payload.get("paragraphs", [])
-                            for p in paras:
-                                pid = str(p.get("paragraphId", ""))
-                                if pid and pid not in paragraphs_seen:
-                                    paragraphs_seen.add(pid)
-                                    all_paragraphs.append(p)
-                                    ch = str(p.get("chapterId", ""))
-                                    if ch:
-                                        chapters_seen.add(ch)
-                    except Exception:
-                        pass
-
-            page.on("response", on_response)
-
-            book_url = f"{self.BASE_URL}/zh/book/{book_id}"
-            logger.info(f"[识典古籍] Loading book for text extraction: {book_url}")
-            try:
-                await page.goto(book_url, wait_until="domcontentloaded", timeout=60000)
-            except Exception as e:
-                logger.warning(f"Page.goto: {e}")
-
-            await asyncio.sleep(5)
-
-            # Determine expected paragraph count from metadata
-            catalog_raw = book_info.get("catalog", "[]")
-            try:
-                catalog = json.loads(catalog_raw) if isinstance(catalog_raw, str) else catalog_raw
-            except Exception:
-                catalog = []
-            total_chapters = len(catalog) or 99
-            # Prefer totalParaNum from the paragraphs API (authoritative) over
-            # bookInfo.paragraphCount, falling back to a guess only if neither
-            # is present.
-            total_paragraphs = (
-                total_from_api.get("n")
-                or int(book_info.get("paragraphCount", 0))
-                or 999
+        # Collecting nothing means the interception never fired (e.g. the
+        # site moved the paragraphs endpoint again). Previously this path
+        # returned an empty result that the caller reported as a successful
+        # download of 0 files — the user-visible shape of issue #1. Fail
+        # loudly instead of pretending it worked.
+        if not paragraphs:
+            raise DownloadError(
+                "[识典古籍] 未能抓取到任何段落。可能是站点接口又变了"
+                f"（当前匹配 {self._PARAGRAPHS_API_RE.pattern}），"
+                "或该书需要登录。请提 issue 附上书籍 URL。"
             )
+        if expected and len(paragraphs) < expected:
+            logger.warning(f"[识典古籍] 正文只获取到 {len(paragraphs)}/{expected} 段，"
+                           "文字不完整（可稍后重试）")
 
-            logger.info(
-                f"[识典古籍] Book has {total_chapters} chapters, "
-                f"~{total_paragraphs} paragraphs, collecting text..."
-            )
-
-            stall_count = 0
-            prev_len = len(paragraphs_seen)
-            max_nav = max(total_paragraphs * 2, total_chapters * 5 + 50)
-
-            for nav in range(max_nav):
-                if len(paragraphs_seen) >= total_paragraphs:
-                    break
-                await page.keyboard.press("ArrowRight")
-                await asyncio.sleep(1.2)
-
-                if len(paragraphs_seen) == prev_len:
-                    stall_count += 1
-                    if stall_count >= 30:
-                        logger.warning(
-                            f"[识典古籍] No new paragraphs after 30 keypresses; stopping "
-                            f"({len(paragraphs_seen)}/{total_paragraphs} paragraphs collected)"
-                        )
-                        break
-                else:
-                    stall_count = 0
-                    prev_len = len(paragraphs_seen)
-                    if progress_callback:
-                        progress_callback(len(paragraphs_seen), total_paragraphs)
-
-                if (nav + 1) % 30 == 0:
-                    logger.info(
-                        f"[识典古籍] Nav {nav+1}: {len(paragraphs_seen)}/{total_paragraphs} paragraphs"
-                    )
-
-            logger.info(
-                f"[识典古籍] Collected {len(all_paragraphs)} paragraphs "
-                f"from {len(chapters_seen)} chapters"
-            )
-
-            # Collecting nothing means the interception never fired (e.g. the
-            # site moved the paragraphs endpoint again). Previously this path
-            # returned an empty result that the caller reported as a successful
-            # download of 0 files — the user-visible shape of issue #1. Fail
-            # loudly instead of pretending it worked.
-            if not all_paragraphs:
-                raise DownloadError(
-                    "[识典古籍] 未能抓取到任何段落。可能是站点接口又变了"
-                    f"（当前匹配 {self._PARAGRAPHS_API_RE.pattern}），"
-                    "或该书需要登录。请提 issue 附上书籍 URL。"
-                )
-
-        finally:
-            await browser.close()
-            await pw.stop()
-
-        if not all_paragraphs:
-            return None
-
+        book_info = self._book_info
         parser = ShidianGujiParser()
         url = f"{self.BASE_URL}/zh/book/{book_id}"
         meta = {
             "title": book_info.get("bookName", ""),
             "authors_json": book_info.get("authors", "[]"),
             "dynasty": book_info.get("dynastyCategoryName", ""),
-            "catalog": catalog if isinstance(catalog, list) else [],
+            "catalog": self._catalog_chapters(book_info),
             "page_nums": dict(self._page_nums),
         }
-        return parser.parse(all_paragraphs, book_id, url, meta)
+        return parser.parse(paragraphs, book_id, url, meta)
+
+    async def _read_text(self, book_id: str,
+                         progress_callback: Callable[[int, int], None] = None) -> None:
+        """Open the reader and read it volume by volume until every paragraph
+        in the catalog has loaded. Stops at once on errorCode 31000."""
+        refused = asyncio.Event()
+        first_paragraphs = asyncio.Event()
+
+        pw, browser, context = await self._launch_browser()
+        try:
+            page = await context.new_page()
+
+            async def on_response(response):
+                await self._record_layout(response)
+                if "/api/ancientlib/" not in response.url:
+                    return
+                try:
+                    data = await response.json()
+                except Exception:
+                    return
+                if data.get("errorCode") == 31000:
+                    refused.set()
+                if self._paragraphs:
+                    first_paragraphs.set()
+
+            page.on("response", on_response)
+
+            book_url = f"{self.BASE_URL}/zh/book/{book_id}"
+            logger.info(f"[识典古籍] Loading book for text extraction: {book_url}")
+            try:
+                await page.goto(book_url, wait_until="domcontentloaded", timeout=90000)
+            except Exception as e:
+                logger.warning(f"Page.goto: {e}")
+            try:
+                await asyncio.wait_for(first_paragraphs.wait(), timeout=self._API_WAIT)
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout waiting for paragraphs API for {book_id}")
+            if refused.is_set():
+                raise DownloadError("[识典古籍] 站点拒绝了请求（31000，访问过于频繁），请过一段时间再试。")
+            if not self._paragraphs:
+                return
+
+            def report() -> None:
+                if progress_callback:
+                    try:
+                        progress_callback(len(self._paragraphs), self._expected_paragraphs() or len(self._paragraphs))
+                    except Exception:
+                        pass
+
+            def status() -> str:
+                return f"{len(self._paragraphs)}/{self._expected_paragraphs() or '?'} paragraphs"
+
+            await self._read_volumes(page, self._text_complete, refused, report, status)
+            self._read_book_id = book_id
+            if refused.is_set():
+                logger.warning("[识典古籍] 读到一半站点开始拒绝请求（31000），已停止。")
+        finally:
+            await browser.close()
+            await pw.stop()
 
     # ------------------------------------------------------------------
     # Search
