@@ -8,7 +8,7 @@ export interface BookPreviewProps {
   outputDir: string;
   /** Opens the OS folder dialog; absent in mock mode. */
   onChangeDir?: () => void;
-  onConfirm: (concurrency: number, pdf: boolean) => void;
+  onConfirm: (concurrency: number, pdf: boolean, byChapter: boolean) => void;
   onChooseParts: () => void;
   onCancel: () => void;
 }
@@ -39,6 +39,11 @@ export const BookPreview: React.FC<BookPreviewProps> = ({
 }) => {
   const [concurrency, setConcurrency] = useState(3);
   const [pdf, setPdf] = useState(false);
+  // 识典古籍 reads one chapter at a time anyway: download it that way by
+  // default, one PDF per chapter, resumable after quitting the app.
+  const chapterSite = site?.site_id === 'shidianguji';
+  const [byChapter, setByChapter] = useState(chapterSite);
+  const resume = manifest.chapter_progress;
   const facts = bookFacts(manifest);
   const cover = coverUrl(manifest);
 
@@ -93,13 +98,31 @@ export const BookPreview: React.FC<BookPreviewProps> = ({
             )}
           </div>
 
+          {onChangeDir && chapterSite && (
+            <label className="g-toggle">
+              <input type="checkbox" checked={byChapter} onChange={e => setByChapter(e.target.checked)} />
+              <span className="g-toggle-track" aria-hidden="true"><span /></span>
+              <span>
+                按章节下载
+                <small>
+                  {resume
+                    ? `上次已完成 ${resume.done}/${resume.total} 章，将从未完成的章节继续`
+                    : '一章一章读取，每章一个带文字层的 PDF；退出后再下载会接着上次的进度'}
+                </small>
+              </span>
+            </label>
+          )}
+
           {onChangeDir && (
             <label className="g-toggle">
-              <input type="checkbox" checked={pdf} onChange={e => setPdf(e.target.checked)} />
+              <input type="checkbox" checked={pdf || (chapterSite && byChapter)}
+                disabled={chapterSite && byChapter}
+                onChange={e => setPdf(e.target.checked)} />
               <span className="g-toggle-track" aria-hidden="true"><span /></span>
               <span>
                 下载后生成 PDF 归档
-                <small>图片原样嵌入，附元数据、书签与资料表</small>
+                <small>{chapterSite && byChapter ? '按章节下载时每章都会生成 PDF'
+                  : '图片原样嵌入，附元数据、书签与资料表'}</small>
               </span>
             </label>
           )}
@@ -114,8 +137,8 @@ export const BookPreview: React.FC<BookPreviewProps> = ({
             <span className="g-spacer" />
             <button className="g-btn g-btn-plain" onClick={onCancel}>取消</button>
             <button className="g-btn g-btn-tinted" onClick={onChooseParts}>选择分卷</button>
-            <button className="g-btn g-btn-primary" onClick={() => onConfirm(concurrency, pdf)} autoFocus>
-              确认下载
+            <button className="g-btn g-btn-primary" onClick={() => onConfirm(concurrency, pdf || (chapterSite && byChapter), chapterSite && byChapter)} autoFocus>
+              {resume && byChapter ? '继续下载' : '确认下载'}
             </button>
           </div>
         </div>

@@ -212,6 +212,7 @@ async def handle_start_download(request: web.Request):
     node_ids = body.get("nodeIds") or body.get("node_ids")
     concurrency = int(body.get("concurrency", 1))
     make_pdf = bool(body.get("pdf"))
+    by_chapter = bool(body.get("byChapter") or body.get("by_chapter"))
     # Honour a client-supplied id so SSE events land on the task the caller is
     # already tracking (the web UI keys everything by its discovery id).
     client_task_id = body.get("taskId") or body.get("task_id") or None
@@ -225,6 +226,7 @@ async def handle_start_download(request: web.Request):
         concurrency=concurrency,
         task_id=client_task_id,
         make_pdf=make_pdf,
+        by_chapter=by_chapter,
     )
     return _json({"taskId": task_id})
 

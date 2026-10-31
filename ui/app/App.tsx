@@ -42,6 +42,8 @@ interface Book {
   site: SiteInfo | null;
   /** Build an archival PDF after the download (`bookget download --pdf`). */
   pdf?: boolean;
+  /** 识典古籍: chapter by chapter, one PDF each, resumable. */
+  byChapter?: boolean;
 }
 
 /** Post JSON to the local server; throws with the server's error text. */
@@ -118,7 +120,13 @@ export const App: React.FC = () => {
       const pct = Number(ev.data.percent);
       if (Number.isFinite(pct)) setLivePercent(prev => ({ ...prev, [ev.taskId]: pct }));
       if (ev.data.phase === 'listing') {
-        const label = `${ev.data.completed}/${ev.data.total}`;
+        const label = `逐页读取中 ${ev.data.completed}/${ev.data.total} 页（较慢，请耐心等待）`;
+        setListing(prev => ({ ...prev, [ev.taskId]: label }));
+      } else if (ev.data.phase === 'chapter') {
+        const d = ev.data;
+        const label = `第 ${d.chapter}/${d.chapters} 章「${d.title}」`
+          + (d.total ? ` ${d.completed}/${d.total} 页` : ' 打开中')
+          + ` · 已完成 ${d.done} 章`;
         setListing(prev => ({ ...prev, [ev.taskId]: label }));
       } else {
         setListing(({ [ev.taskId]: _, ...rest }) => rest);
@@ -143,7 +151,10 @@ export const App: React.FC = () => {
 
   const download = useCallback((b: Book, nodeIds?: string[], concurrency?: number) => {
     setTaskErrors(({ [b.taskId]: _, ...rest }) => rest);
-    startDownload({ taskId: b.taskId, url: b.url, outputDir: b.dir, nodeIds, concurrency, pdf: b.pdf })
+    startDownload({
+      taskId: b.taskId, url: b.url, outputDir: b.dir, nodeIds, concurrency, pdf: b.pdf,
+      byChapter: b.byChapter,
+    })
       .catch(e => setTaskErrors(prev => ({
         ...prev, [b.taskId]: e instanceof Error ? e.message : String(e),
       })));
@@ -224,16 +235,18 @@ export const App: React.FC = () => {
   }, [pending]);
 
   const addBook = useCallback((p: Pending) => {
-    setBooks(prev => [{ taskId: p.taskId, url: p.url, dir: p.dir, site: p.site, pdf: p.pdf },
+    setBooks(prev => [{
+      taskId: p.taskId, url: p.url, dir: p.dir, site: p.site, pdf: p.pdf, byChapter: p.byChapter,
+    },
       ...prev.filter(b => b.taskId !== p.taskId)]);
     setOpenId(p.taskId);
     setPending(null);
     setUrl('');
   }, []);
 
-  const handleConfirm = useCallback((concurrency: number, pdf: boolean) => {
+  const handleConfirm = useCallback((concurrency: number, pdf: boolean, byChapter: boolean) => {
     if (!pending) return;
-    const book = { ...pending, pdf };
+    const book = { ...pending, pdf, byChapter };
     download(book, undefined, concurrency);
     addBook(book);
   }, [pending, download, addBook]);
@@ -401,7 +414,7 @@ const BookRow: React.FC<BookRowProps> = ({
   const done = p.total > 0 && p.completed === p.total;
   const failed = !downloading && (!!error || p.failed > 0);
   const state = pdfBusy ? '正在生成 PDF…'
-    : downloading && listing ? `逐页读取中 ${listing} 页（较慢，请耐心等待）`
+    : downloading && listing ? listing
     : downloading ? '下载中' : done ? '已完成'
     : error ? '下载失败' : p.failed > 0 ? `${p.failed} 项失败` : '等待下载';
 
@@ -438,7 +451,9 @@ const BookRow: React.FC<BookRowProps> = ({
             </button>
           )}
           {pdfPath ? (
-            <button className="g-btn g-btn-tinted g-btn-sm" onClick={() => onReveal(pdfPath)}>打开 PDF</button>
+            <button className="g-btn g-btn-tinted g-btn-sm" onClick={() => onReveal(pdfPath)}>
+              {pdfPath.toLowerCase().endsWith('.pdf') ? '打开 PDF' : '打开各章 PDF'}
+            </button>
           ) : (
             <button className="g-btn g-btn-tinted g-btn-sm" onClick={onBuildPdf}
               disabled={!done || downloading || pdfBusy}

@@ -79,6 +79,11 @@ class TaskManager:
             result = manifest.to_dict()
             if output_dir:
                 result["output_dir"] = str(Path(output_dir).resolve())
+                # A chapter-by-chapter download left here earlier resumes.
+                from ..core.chapter_download import progress_summary
+                chapters = progress_summary(Path(output_dir))
+                if chapters:
+                    result["chapter_progress"] = chapters
             return result
         finally:
             await manager.close()
@@ -107,6 +112,7 @@ class TaskManager:
         index_id: str = "",
         task_id: str | None = None,
         make_pdf: bool = False,
+        by_chapter: bool = False,
     ) -> str:
         """
         Start an incremental download task asynchronously.
@@ -124,7 +130,7 @@ class TaskManager:
 
         info.asyncio_task = asyncio.create_task(
             self._run_download(task_id, url, output_dir, node_ids, concurrency, index_id,
-                               make_pdf)
+                               make_pdf, by_chapter)
         )
         return task_id
 
@@ -346,6 +352,7 @@ class TaskManager:
         concurrency: int,
         index_id: str,
         make_pdf: bool = False,
+        by_chapter: bool = False,
     ):
         info = self._tasks[task_id]
         info.status = "running"
@@ -380,6 +387,9 @@ class TaskManager:
             })
 
         try:
+            if by_chapter and self.supports_chapters(url):
+                await self._download_by_chapter(manager, url, output_dir, make_pdf, task_id)
+                return
             if self._has_node_download(url):
                 manifest = await manager.download_incremental(
                     url=url,
@@ -418,6 +428,56 @@ class TaskManager:
             })
         finally:
             await manager.close()
+
+    def supports_chapters(self, url: str) -> bool:
+        """Whether the site can be downloaded chapter by chapter."""
+        adapter = get_adapter(url, self.config)
+        return adapter is not None and hasattr(type(adapter), "read_chapter")
+
+    async def _download_by_chapter(
+        self, manager: ResourceManager, url: str, output_dir: str, make_pdf: bool, task_id: str,
+    ) -> None:
+        """Each chapter on its own, with its own PDF; progress is kept in
+        chapters.json so a later run continues where this one stopped."""
+        from ..core.chapter_download import download_by_chapter
+
+        info = self._tasks[task_id]
+        dest = Path(output_dir)
+
+        def on_progress(p: dict):
+            total = p["chapters"] or 1
+            frac = p["pages_found"] / p["pages"] if p["pages"] else 0
+            self.bus.publish("progress", {
+                "taskId": task_id, "phase": "chapter",
+                "chapter": p["chapter"], "chapters": p["chapters"], "title": p["title"],
+                "completed": p["pages_found"], "total": p["pages"], "done": p["done"],
+                "percent": min(100, round((p["done"] + frac) * 100 / total)),
+            })
+
+        state = await download_by_chapter(manager, url, dest, make_pdf=make_pdf, on_progress=on_progress)
+        chapters = state["chapters"]
+        partial = [c for c in chapters if c["status"] not in ("done", "empty")]
+        manifest = DownloadManifest.load(dest / ResourceManager.MANIFEST_FILENAME)
+        if manifest and not partial:
+            def mark(node):
+                node.status = NodeStatus.COMPLETED
+                node.downloaded_items = node.total_items
+                for child in node.children:
+                    mark(child)
+            mark(manifest.root)
+            manager._save_hierarchical_manifests(manifest, dest)
+        info.manifest = manifest
+        if partial:
+            names = "、".join(f"「{c['title']}」" for c in partial[:5]) + ("等" if len(partial) > 5 else "")
+            raise RuntimeError(
+                f"{len(chapters) - len(partial)}/{len(chapters)} 章已完整下载；{names}共 {len(partial)} 章"
+                f"不完整（缺页或缺文字），已保存现有部分。再点下载会只重试这些章节。")
+        info.status = "completed"
+        self.bus.publish("task_completed", {
+            "taskId": task_id,
+            "manifest": manifest.to_dict() if manifest else None,
+            "pdfPath": str((dest / "chapters").resolve()) if make_pdf else None,
+        })
 
     def _has_node_download(self, url: str) -> bool:
         """Whether the site's adapter implements per-node download_node()."""

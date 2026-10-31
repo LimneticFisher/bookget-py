@@ -39,6 +39,7 @@ a = Analysis(
         *pw_hidden,
         # core
         'bookget.core',
+        'bookget.core.chapter_download',
         'bookget.models',
         'bookget.pdf',
         'bookget.pdf.writer',

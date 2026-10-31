@@ -18,6 +18,8 @@ export interface DownloadRequest {
   concurrency?: number;
   /** Build the archival PDF once the download finishes. */
   pdf?: boolean;
+  /** Chapter by chapter, one PDF per chapter, resumable (识典古籍). */
+  byChapter?: boolean;
 }
 
 /** Request to expand a manifest node */

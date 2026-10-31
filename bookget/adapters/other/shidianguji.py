@@ -317,6 +317,19 @@ class ShidianGujiAdapter(BaseSiteAdapter):
         expected = self._expected_paragraphs()
         return bool(expected) and len(self._paragraphs) >= expected
 
+    async def _read_through(self, page, pane: str, done: Callable[[], bool],
+                            refused: asyncio.Event, report: Callable[[], None] = None) -> None:
+        """Scroll one pane of the reader to its end, slowly."""
+        stuck = 0
+        while stuck < 2 and not refused.is_set():
+            moved = await page.evaluate(self._SCROLL_TEXT_JS, [pane, self._SCROLL_STEP])
+            await asyncio.sleep(self._SCROLL_PAUSE)
+            stuck = 0 if moved else stuck + 1
+            if report:
+                report()
+            if done():
+                return
+
     async def _read_volumes(self, page, done: Callable[[], bool], refused: asyncio.Event,
                             report: Callable[[], None] = None,
                             status: Callable[[], str] = None) -> None:
@@ -326,16 +339,7 @@ class ShidianGujiAdapter(BaseSiteAdapter):
         the site starts refusing requests."""
 
         async def read_through_current_volume() -> None:
-            stuck = 0
-            while stuck < 2 and not refused.is_set():
-                moved = await page.evaluate(self._SCROLL_TEXT_JS,
-                                            [self._TEXT_PANE, self._SCROLL_STEP])
-                await asyncio.sleep(self._SCROLL_PAUSE)
-                stuck = 0 if moved else stuck + 1
-                if report:
-                    report()
-                if done():
-                    return
+            await self._read_through(page, self._TEXT_PANE, done, refused, report)
 
         await asyncio.sleep(self._CHAPTER_PAUSE)
         await read_through_current_volume()
@@ -409,6 +413,7 @@ class ShidianGujiAdapter(BaseSiteAdapter):
         if not book_info:
             raise MetadataExtractionError(f"Failed to get metadata for {book_id}")
 
+        self._book_info.update(book_info)
         metadata = self._parse_metadata(book_info, book_id)
         self._metadata_cache[book_id] = metadata
         return metadata
@@ -484,6 +489,7 @@ class ShidianGujiAdapter(BaseSiteAdapter):
     _SCROLL_PAUSE = 3.0         # seconds between scrolls
     _CHAPTER_PAUSE = 6.0        # seconds after opening a volume
     _TEXT_PANE = ".chapter-reader-container"
+    _IMAGE_PANE = ".chapter-reader"
     _TOC_ITEM = ".semi-tree-option"
     _TOC_LIST = ".semi-tree-option-list"
 
@@ -611,10 +617,17 @@ class ShidianGujiAdapter(BaseSiteAdapter):
             await browser.close()
             await pw.stop()
 
-        pages_data = list(pages_by_num.values())
-        # Build Resource list ordered by pageNum
+        return self._resources(pages_by_num, image_map)
+
+    @staticmethod
+    def _resources(pages_by_num: dict[int, dict], image_map: dict[str, str],
+                   only: Optional[set] = None) -> List[Resource]:
+        """Resources for the listed pages whose signed image URL was seen,
+        ordered by pageNum (optionally only the page numbers in `only`)."""
         resources: List[Resource] = []
-        for pg in sorted(pages_data, key=lambda x: x.get("pageNum", 0)):
+        for num, pg in sorted(pages_by_num.items()):
+            if only is not None and num not in only:
+                continue
             uri = pg.get("uri", "")
             page_num = pg.get("pageNum", 0)
 
@@ -638,6 +651,135 @@ class ShidianGujiAdapter(BaseSiteAdapter):
                 logger.warning(f"[识典古籍] No signed URL found for page {page_num} (uri={uri})")
 
         return resources
+
+    # ------------------------------------------------------------------
+    # Chapter by chapter
+    # ------------------------------------------------------------------
+
+    def chapter_plan(self) -> list[dict]:
+        """Chapters in reading order with the pages each covers, from the
+        catalog get_metadata saw: {"id", "title", "start", "end", "paragraphs",
+        "content"}. A chapter runs to its endPageNumWithoutSubchapter, else to
+        the page the next chapter starts on (a short chapter can share that
+        page), the last one to the book's last page."""
+        chs = [c for c in self._catalog_chapters(self._book_info) if c.get("chapterId")]
+        total = int(self._book_info.get("totalPage") or 0)
+        plan = []
+        for i, c in enumerate(chs):
+            start = int(c.get("startPageNum") or 0)
+            nxt = next((int(n.get("startPageNum") or 0) for n in chs[i + 1:]
+                        if int(n.get("startPageNum") or 0) >= start), 0)
+            end = int(c.get("endPageNumWithoutSubchapter") or 0) or (
+                max(start, nxt - 1) if nxt else (total or start))
+            paragraphs = int(c.get("paragraphCount") or 0)
+            plan.append({
+                "id": str(c["chapterId"]), "title": c.get("title") or f"第{i + 1}章",
+                "start": start, "end": max(start, end) if start else 0,
+                "paragraphs": paragraphs,
+                "content": bool(paragraphs or c.get("hasMainContent", True)),
+            })
+        return plan
+
+    async def read_chapter(self, book_id: str, chapter: dict,
+                           progress_callback: Callable[[int, int], None] = None
+                           ) -> tuple[List[Resource], list[dict]]:
+        """Open the reader at one chapter (a fresh browser, as everywhere
+        here) and read that chapter to its end, slowly, recording what the
+        reader loads by itself. Returns the chapter's page images and its
+        paragraphs; character boxes go to page_text_layer() as usual.
+        Raises DownloadError if the site refuses requests (errorCode 31000).
+        """
+        self._check_playwright()
+        cid = chapter["id"]
+        lo, hi = chapter.get("start") or 0, chapter.get("end") or 0
+        want = set(range(lo, hi + 1)) if lo else set()
+        pages_by_num: dict[int, dict] = {}
+        image_map: dict[str, str] = {}
+        refused = asyncio.Event()
+        loaded = asyncio.Event()
+
+        def paragraphs() -> list[dict]:
+            return [p for p in self._paragraphs.values() if str(p.get("chapterId", "")) == cid]
+
+        def captured() -> set:
+            return {n for n, pg in pages_by_num.items() if n in want and pg.get("uri") in image_map}
+
+        def done() -> bool:
+            return want <= captured() and len(paragraphs()) >= chapter.get("paragraphs", 0)
+
+        def report() -> None:
+            if progress_callback:
+                try:
+                    progress_callback(len(captured()), len(want))
+                except Exception:
+                    pass
+
+        pw, browser, context = await self._launch_browser()
+        try:
+            page = await context.new_page()
+
+            async def on_request(request):
+                url = request.url
+                if self._CDN_HOST in url and "ancientlib" in url and ".webp" in url:
+                    m = re.search(r'/tos-cn-i-[^/]+/(.+?)(?:~|$|\?)', url)
+                    if m and m.group(1) not in image_map:
+                        image_map[m.group(1)] = url
+
+            async def on_response(response):
+                await self._record_layout(response)
+                if "/api/ancientlib/" not in response.url:
+                    return
+                try:
+                    data = await response.json()
+                except Exception:
+                    return
+                if data.get("errorCode") == 31000:
+                    refused.set()
+                if "/api/ancientlib/read/book/pages/v3/" in response.url and data.get("errorCode") == 0:
+                    for pg in data["data"]["pages"]:
+                        try:
+                            pages_by_num[int(pg["pageNum"])] = pg
+                        except (KeyError, TypeError, ValueError):
+                            pass
+                if pages_by_num or paragraphs():
+                    loaded.set()
+
+            page.on("request", on_request)
+            page.on("response", on_response)
+
+            url = f"{self.BASE_URL}/book/{book_id}/chapter/{cid}"
+            logger.info(f"[识典古籍] 「{chapter.get('title', cid)}」 pages {lo}-{hi}: {url}")
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+            except Exception as e:
+                logger.warning(f"Page.goto: {e}")
+            try:
+                await asyncio.wait_for(loaded.wait(), timeout=self._API_WAIT)
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout waiting for the reader at chapter {cid}")
+            if not refused.is_set() and loaded.is_set():
+                await asyncio.sleep(self._CHAPTER_PAUSE)
+                await self._read_through(page, self._TEXT_PANE, done, refused, report)
+                if not refused.is_set() and not done():
+                    # Pages without text (covers, blank leaves) only load when
+                    # the image pane itself is scrolled past them.
+                    await page.evaluate(
+                        "(sel) => { const e = document.querySelector(sel); if (e) e.scrollTop = 0; }",
+                        self._IMAGE_PANE)
+                    await asyncio.sleep(self._SCROLL_PAUSE)
+                    await self._read_through(page, self._IMAGE_PANE, done, refused, report)
+            if refused.is_set():
+                raise DownloadError("[识典古籍] 站点拒绝了请求（31000，访问过于频繁），已停止；"
+                                    "已完成的章节都已保存，过一段时间再点下载会接着下。")
+        finally:
+            await browser.close()
+            await pw.stop()
+
+        got = captured()
+        logger.info(f"[识典古籍] 「{chapter.get('title', cid)}」: {len(got)}/{len(want)} page images, "
+                    f"{len(paragraphs())}/{chapter.get('paragraphs', 0)} paragraphs")
+        paras = sorted(paragraphs(), key=lambda p: (p.get("chapterOrder", 0), p.get("inChapterOrder", 0)))
+        return self._resources(pages_by_num, image_map, want), paras
 
     # ------------------------------------------------------------------
     # Structured text

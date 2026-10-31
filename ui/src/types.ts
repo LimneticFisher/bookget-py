@@ -53,6 +53,8 @@ export interface ManifestData {
   updated_at: string;
   /** Folder the server resolved for this book (discover with outputRoot). */
   output_dir?: string;
+  /** An earlier chapter-by-chapter download in that folder. */
+  chapter_progress?: { done: number; partial: number; total: number };
 }
 
 /** Site information */
